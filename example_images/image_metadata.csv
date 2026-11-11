@@ -1,0 +1,5 @@
+file,plate_well,condition,p80_pct,well,field,primary_ab
+if_001.tif,,ctrl,0,well1,1,occludin + claudin-1
+if_002.tif,,P80-0.01,0.01,well1,1,occludin + claudin-1
+if_003.tif,,P80-0.1,0.1,well1,1,occludin + claudin-1
+if_004.tif,,P80-0.5,0.5,well1,1,occludin + claudin-1

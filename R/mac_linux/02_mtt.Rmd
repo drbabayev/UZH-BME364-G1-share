@@ -1,0 +1,141 @@
+---
+title: "BME364: 02 MTT viability"
+subtitle: "OD540 → blank → % of control → ANOVA + Dunnett → IC50"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+---
+
+```{r setup, include = FALSE}
+# Run every chunk from the project folder (two levels up from R/mac_linux/), where data/ is
+knitr::opts_knit$set(root.dir = "../..")
+knitr::opts_chunk$set(message = FALSE, fig.width = 6.4, fig.height = 4.2)
+```
+
+**Data:** `data/mtt_raw.csv`, one 96-well plate of Caco-2 cells, 48 h P80 at 1, 0.5, 0.25, 0.125,
+0.0625 and 0.03125 % v/v (2-fold dilutions, 1:32) in columns 3–8. The vehicle control (0 %) is in
+columns 2 **and** 9, on both sides of the series, and the blank (medium + MTT + DMSO, no cells) in
+column 10. Rows B–G = 6 technical replicate wells. One experiment, so n = wells.
+
+```{r packages}
+library(tidyverse)
+library(rstatix)
+library(emmeans)
+dir.create("results", showWarnings = FALSE)
+dir.create("figures", showWarnings = FALSE)
+theme_set(theme_minimal(base_size = 15) + theme(panel.grid.minor = element_blank()))
+```
+
+```{r import}
+mtt <- read_csv("data/mtt_raw.csv")
+```
+
+## Step 1: background
+
+The background is the mean of the blank wells (medium + MTT + DMSO, no cells).
+
+```{r blank}
+blank <- mtt %>% filter(condition == "blank") %>% pull(od540) %>% mean()
+blank
+```
+
+## Step 2: % of control
+
+Subtract the blank from every well, then divide by the **mean** of the control wells.
+
+```{r normalise}
+wells <- mtt %>% filter(condition != "blank") %>%
+  mutate(od_corr   = od540 - blank,
+         viability = 100 * od_corr / mean(od_corr[p80_pct == 0]),
+         dose      = factor(p80_pct),                    # "0" = control, the reference
+         column    = as.integer(str_sub(well, 2)))       # plate column (2-10)
+write_csv(wells, "results/mtt_per_well.csv")
+```
+
+**Plate check:** the two control columns (2 and 9) flank the series. A difference between them points to
+a gradient across the plate (edge effect, pipetting order, temperature).
+
+```{r control-columns}
+wells %>% filter(p80_pct == 0) %>% mutate(side = factor(column)) %>%
+  t_test(viability ~ side, detailed = TRUE)
+```
+
+## Step 3: describe
+
+Mean ± SD of the wells per concentration (12 control wells).
+
+```{r describe}
+wells %>% group_by(p80_pct) %>%
+  summarise(mean_viability = mean(viability), sd = sd(viability), n = n())
+```
+
+## Step 4: assumptions
+
+Normality of the residuals and equal variances.
+
+```{r assumptions}
+fit <- aov(viability ~ dose, data = wells)
+shapiro_test(residuals(fit))
+wells %>% levene_test(viability ~ dose)
+```
+
+## Step 5: every concentration vs control
+
+One-way ANOVA, then Dunnett: each concentration against the control.
+
+```{r dunnett}
+wells %>% anova_test(viability ~ dose)
+emmeans(fit, trt.vs.ctrl ~ dose)$contrasts %>% summary(infer = TRUE)
+```
+
+When Levene says the SDs differ: Welch ANOVA + Games–Howell. As a rank-based check: Kruskal–Wallis +
+Dunn vs control, Holm-adjusted over the 6 comparisons.
+
+```{r unequal-sd}
+wells %>% welch_anova_test(viability ~ dose)
+wells %>% games_howell_test(viability ~ dose) %>% filter(group1 == "0")
+wells %>% kruskal_test(viability ~ dose)
+wells %>% dunn_test(viability ~ dose, p.adjust.method = "none") %>% filter(group1 == "0") %>%
+  adjust_pvalue(method = "holm")
+```
+
+## Step 6: dose-response curve and IC50
+
+4-parameter log-logistic fit on all wells; the IC50 is the concentration that gives 50 % viability.
+
+```{r ic50}
+curve <- drc::drm(viability ~ p80_pct, data = wells, fct = drc::LL.4(
+  names = c("Hill", "Bottom", "Top", "IC50")))
+summary(curve)
+ic50 <- drc::ED(curve, 50, type = "absolute", interval = "delta", display = FALSE)
+ic50
+```
+
+## Plot
+
+Dose response on a log axis; the control is drawn on the left as "0".
+
+```{r plot}
+x0   <- 0.0156                                          # plotting position of the control
+pts  <- wells %>% mutate(x = if_else(p80_pct == 0, x0, p80_pct))
+grid <- tibble(p80_pct = exp(seq(log(0.025), log(1.2), length.out = 200)))
+grid$viability <- predict(curve, newdata = as.data.frame(grid))
+p <- ggplot(pts, aes(x, viability)) +
+  geom_line(data = grid, aes(p80_pct, viability), colour = "#BF0D3E", linewidth = 0.9) +
+  stat_summary(fun.data = mean_sdl, fun.args = list(mult = 1), geom = "errorbar",
+               width = 0.08, colour = "#333333") +
+  geom_jitter(aes(colour = p80_pct == 0), width = 0.03, height = 0, size = 2, alpha = 0.7) +
+  annotate("point", x = ic50[1], y = 50, shape = 23, size = 3.5, fill = "white",
+           colour = "#BF0D3E", stroke = 1.2) +
+  annotate("text", x = ic50[1] * 1.15, y = 50, hjust = 0, colour = "#BF0D3E", size = 4.1,
+           label = sprintf("IC50 = %.2f %%", ic50[1])) +
+  scale_colour_manual(values = c(`TRUE` = "#0028A5", `FALSE` = "#BF0D3E"), guide = "none") +
+  scale_x_log10(breaks = c(x0, 0.03125, 0.0625, 0.125, 0.25, 0.5, 1),
+                labels = c("0", "0.031", "0.063", "0.125", "0.25", "0.5", "1")) +
+  scale_y_continuous(limits = c(-5, 125), breaks = seq(0, 120, 20)) +
+  labs(x = "P80 (% v/v, log scale)", y = "Viability (% of control)",
+       caption = "Simulated data, points = wells (n = 6; control 12); mean ± SD; line = 4-parameter fit")
+p
+ggsave("figures/02_mtt_viability.png", p, width = 6.4, height = 4.2, dpi = 200, bg = "white")
+```

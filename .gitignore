@@ -1,0 +1,9 @@
+.DS_Store
+._*
+.Rproj.user/
+.Rhistory
+R/*/*.html
+R/*/*_files/
+results/*.csv
+figures/*.png
+example_images/results.csv

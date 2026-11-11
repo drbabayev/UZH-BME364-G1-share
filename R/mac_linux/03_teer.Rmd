@@ -1,0 +1,151 @@
+---
+title: "BME364: 03 TEER"
+subtitle: "Ω → blank → Ω cm² → % of baseline → statistics"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+---
+
+```{r setup, include = FALSE}
+# Run every chunk from the project folder (two levels up from R/mac_linux/), where data/ is
+knitr::opts_knit$set(root.dir = "../..")
+knitr::opts_chunk$set(message = FALSE, fig.width = 6, fig.height = 4.1)
+```
+
+**Data:** `data/teer_raw.csv`, Caco-2 on 0.33 cm² inserts in a 24-well Transwell plate: control and
+P80 0.02, 0.1 and 0.5 %, 4 inserts each (rows A–D, columns 1–4; insert = plate position) and 1 empty
+insert (A5) as blank. Read at baseline, 24 h and 48 h; the 2nd and 3rd readings are recorded.
+n = inserts.
+
+```{r packages}
+library(tidyverse)
+library(rstatix)
+library(lmerTest)
+library(emmeans)
+dir.create("results", showWarnings = FALSE)
+dir.create("figures", showWarnings = FALSE)
+theme_set(theme_minimal(base_size = 15) +
+            theme(panel.grid.minor = element_blank(), legend.position = "top"))
+conds  <- c("ctrl", "P80-0.02", "P80-0.1", "P80-0.5")
+labels <- c(ctrl = "Control", `P80-0.02` = "P80 0.02 %", `P80-0.1` = "P80 0.1 %",
+            `P80-0.5` = "P80 0.5 %")
+cols   <- c(ctrl = "#0028A5", `P80-0.02` = "#F3537F", `P80-0.1` = "#BF0D3E",
+            `P80-0.5` = "#60061F")                      # control blue, P80 light -> dark
+```
+
+```{r import}
+area_cm2 <- 0.33
+raw <- read_csv("data/teer_raw.csv")
+```
+
+## Step 1: average the readings
+
+The recorded readings of each insert at each time point are averaged.
+
+```{r average}
+teer <- raw %>%
+  group_by(insert, condition, time_h) %>%
+  summarise(r_ohm = mean(r_ohm), .groups = "drop")
+```
+
+## Step 2: blank and area
+
+Subtract the empty insert measured at the same time, then multiply by the membrane area.
+
+```{r ohm-cm2}
+blank <- teer %>% filter(condition == "blank") %>% select(time_h, r_blank = r_ohm)
+teer <- teer %>% filter(condition != "blank") %>%
+  left_join(blank, by = "time_h") %>%
+  mutate(teer = (r_ohm - r_blank) * area_cm2,            # Ω cm²
+         condition = factor(condition, levels = conds))
+```
+
+## Step 3: % of baseline
+
+Each insert relative to its own baseline (0 h, before P80).
+
+```{r baseline}
+teer <- teer %>% group_by(insert) %>% arrange(time_h, .by_group = TRUE) %>%
+  mutate(pct_baseline = 100 * teer / first(teer)) %>% ungroup()
+write_csv(teer, "results/teer_per_insert.csv")           # 04_flux.Rmd uses this file
+
+teer %>% group_by(condition, time_h) %>%
+  summarise(mean_teer = mean(teer), sd_teer = sd(teer), mean_pct = mean(pct_baseline),
+            sd_pct = sd(pct_baseline), .groups = "drop")
+```
+
+## Step 4: end-point at 48 h
+
+% of baseline at 48 h, every P80 concentration vs control: assumptions, one-way ANOVA, Dunnett.
+
+```{r endpoint}
+end48 <- teer %>% filter(time_h == 48)
+fit48 <- aov(pct_baseline ~ condition, data = end48)
+shapiro_test(residuals(fit48))
+end48 %>% levene_test(pct_baseline ~ condition)
+end48 %>% anova_test(pct_baseline ~ condition)
+emmeans(fit48, trt.vs.ctrl ~ condition)$contrasts %>% summary(infer = TRUE)
+```
+
+Unequal SDs: Welch ANOVA + Games–Howell. Rank-based check: Kruskal–Wallis + Dunn vs control (Holm).
+
+```{r endpoint-checks}
+end48 %>% welch_anova_test(pct_baseline ~ condition)
+end48 %>% games_howell_test(pct_baseline ~ condition) %>% filter(group1 == "ctrl")
+end48 %>% kruskal_test(pct_baseline ~ condition)
+end48 %>% dunn_test(pct_baseline ~ condition, p.adjust.method = "none") %>%
+  filter(group1 == "ctrl") %>% adjust_pvalue(method = "holm")
+```
+
+## Step 5: the whole time course
+
+Linear mixed model with the insert as random intercept: the same insert is read at 0, 24 and 48 h
+(repeated measures).
+
+```{r mixed-model}
+teer <- teer %>% mutate(time_f = factor(time_h))
+fit <- lmer(teer ~ condition * time_f + (1 | insert), data = teer)
+anova(fit)
+emmeans(fit, trt.vs.ctrl ~ condition | time_f)$contrasts
+```
+
+## Plot
+
+```{r plot}
+p <- ggplot(teer, aes(time_h, pct_baseline, colour = condition)) +
+  geom_line(aes(group = insert), alpha = 0.25) +
+  stat_summary(fun = mean, geom = "line", linewidth = 1.2) +
+  stat_summary(fun.data = mean_sdl, fun.args = list(mult = 1), geom = "errorbar", width = 1.5) +
+  stat_summary(fun = mean, geom = "point", size = 3, aes(shape = condition)) +
+  scale_colour_manual(values = cols, labels = labels) +
+  scale_shape_manual(values = c(16, 15, 17, 18), labels = labels) +
+  scale_x_continuous(breaks = c(0, 24, 48)) +
+  labs(x = "Time after P80 (h)", y = "TEER (% of baseline)", colour = NULL, shape = NULL,
+       caption = "Simulated data, mean ± SD of 4 inserts; faint lines = single inserts")
+p
+ggsave("figures/03_teer_timecourse.png", p, width = 6, height = 4.1, dpi = 200, bg = "white")
+```
+
+## Dose plot
+
+TEER at 48 h against the P80 concentration, log scale. The control has no P80; it sits at the left.
+
+```{r dose-plot}
+dose_x <- c(ctrl = 0.006, `P80-0.02` = 0.02, `P80-0.1` = 0.1, `P80-0.5` = 0.5)
+end48 <- end48 %>% mutate(dose = dose_x[as.character(condition)])
+pd <- ggplot(end48, aes(dose, pct_baseline)) +
+  geom_hline(yintercept = 100, linetype = "dashed", colour = "grey60") +
+  stat_summary(fun = mean, geom = "line", colour = "grey40", linewidth = 0.9) +
+  stat_summary(fun.data = mean_sdl, fun.args = list(mult = 1), geom = "errorbar",
+               width = 0.1, colour = "grey40") +
+  geom_point(aes(colour = condition, shape = condition), size = 3,
+             position = position_jitter(width = 0.04, height = 0, seed = 364)) +
+  scale_x_log10(breaks = dose_x, labels = c("Control", "0.02", "0.1", "0.5")) +
+  scale_colour_manual(values = cols, guide = "none") +
+  scale_shape_manual(values = c(16, 15, 17, 18), guide = "none") +
+  labs(x = "P80 (% v/v, log scale)", y = "TEER at 48 h (% of baseline)",
+       caption = "Simulated data, one point per insert; line and bars = mean ± SD (n = 4)")
+pd
+ggsave("figures/03_teer_dose.png", pd, width = 6, height = 4.1, dpi = 200, bg = "white")
+```
