@@ -1,0 +1,83 @@
+---
+title: "BME364: 01 Parametric and nonparametric tests"
+subtitle: "Group I, one example dataset, two groups"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+---
+
+```{r setup, include = FALSE}
+# Run every chunk from the project folder (two levels up from R/windows/), where data/ is
+knitr::opts_knit$set(root.dir = "../..")
+knitr::opts_chunk$set(message = FALSE, fig.width = 5, fig.height = 3.9)
+```
+
+**Data:** `data/stats_example.csv`, 2 groups (control, P80), 6 wells each. Simulated; one
+experiment, so n = wells.
+
+```{r packages}
+library(tidyverse)
+library(rstatix)
+dir.create("figures", showWarnings = FALSE)
+theme_set(theme_minimal(base_size = 15) + theme(panel.grid.minor = element_blank()))
+```
+
+```{r import}
+d <- read_csv("data/stats_example.csv") %>%
+  mutate(group = fct_relevel(group, "ctrl", "P80"))
+```
+
+## 1. Describe
+
+```{r describe}
+d %>% group_by(group) %>% get_summary_stats(value, type = "mean_sd")
+```
+
+## 2. Check the assumptions
+
+Normality per group (Shapiro–Wilk) and equal variances (Levene).
+
+```{r assumptions}
+d %>% group_by(group) %>% shapiro_test(value)
+d %>% levene_test(value ~ group)
+```
+
+## 3a. Parametric: Student and Welch t-test
+
+Student assumes equal SDs; Welch does not and is the default. `detailed = TRUE` adds the difference
+and its 95 % CI.
+
+```{r t-tests}
+d %>% t_test(value ~ group, var.equal = TRUE)
+d %>% t_test(value ~ group, detailed = TRUE)
+d %>% cohens_d(value ~ group)
+```
+
+## 3b. Nonparametric: Mann–Whitney U (Wilcoxon rank-sum)
+
+```{r wilcoxon}
+d %>% wilcox_test(value ~ group)
+d %>% wilcox_effsize(value ~ group)
+```
+
+## 3c. Skewed data: log-transform, then parametric again
+
+```{r log}
+d_log <- d %>% mutate(log_value = log10(value))
+d_log %>% group_by(group) %>% shapiro_test(log_value)
+d_log %>% t_test(log_value ~ group, detailed = TRUE)
+```
+
+## 4. Plot: every point + mean ± SD
+
+```{r plot}
+p <- ggplot(d, aes(group, value)) +
+  geom_jitter(width = 0.08, size = 3, alpha = 0.7, colour = "#333333") +
+  stat_summary(fun.data = mean_sdl, fun.args = list(mult = 1),
+               geom = "errorbar", width = 0.2, colour = "#0028A5", linewidth = 1) +
+  stat_summary(fun = mean, geom = "crossbar", width = 0.4, colour = "#0028A5") +
+  labs(x = NULL, y = "Relative level", caption = "Simulated data, mean \u00B1 SD, n = 6 wells")
+p
+ggsave("figures/01_statistics.png", p, width = 5, height = 3.9, dpi = 200, bg = "white")
+```

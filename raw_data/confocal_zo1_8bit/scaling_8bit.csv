@@ -1,0 +1,3 @@
+tiff_channel,name,raw_min,raw_max,rule
+1,ZO-1 (Alexa 546),0,65535,8bit = clip(raw / raw_max * 255); raw_max = max over images of the 99.99th percentile
+2,DAPI,0,65535,8bit = clip(raw / raw_max * 255); raw_max = max over images of the 99.99th percentile

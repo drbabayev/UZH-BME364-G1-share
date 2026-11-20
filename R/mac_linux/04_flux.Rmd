@@ -1,0 +1,183 @@
+---
+title: "BME364: 04 FITC-dextran flux"
+subtitle: "RFU → standard curve → µg/mL → amount crossed → Papp → statistics"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+---
+
+```{r setup, include = FALSE}
+# Run every chunk from the project folder (two levels up from R/mac_linux/), where data/ is
+knitr::opts_knit$set(root.dir = "../..")
+knitr::opts_chunk$set(message = FALSE, fig.width = 6, fig.height = 4.1)
+```
+
+**Data:** `data/flux_standards.csv`, `data/flux_samples.csv`, FITC-dextran 4 kDa (FD4), one 24 h
+end-point on the 16 inserts of the TEER experiment: control, P80 0.02, 0.1 and 0.5 %, 4 inserts each.
+n = inserts. **Knit `03_teer.Rmd` first:** step 5 uses its `results/teer_per_insert.csv`.
+
+```{r packages}
+library(tidyverse)
+library(rstatix)
+library(emmeans)
+dir.create("results", showWarnings = FALSE)
+dir.create("figures", showWarnings = FALSE)
+theme_set(theme_minimal(base_size = 15) +
+            theme(panel.grid.minor = element_blank(), legend.position = "top"))
+conds  <- c("ctrl", "P80-0.02", "P80-0.1", "P80-0.5")
+labels <- c(ctrl = "Control", `P80-0.02` = "P80 0.02 %", `P80-0.1` = "P80 0.1 %",
+            `P80-0.5` = "P80 0.5 %")
+cols   <- c(ctrl = "#0028A5", `P80-0.02` = "#F3537F", `P80-0.1` = "#BF0D3E",
+            `P80-0.5` = "#60061F")                      # control blue, P80 light -> dark
+```
+
+```{r constants}
+area_cm2 <- 0.33        # membrane area (cm²)
+C0       <- 500         # apical FD4 at the start: 0.5 mg/mL = 500 µg/mL (= µg/cm³)
+V_api    <- 0.3         # apical volume (mL)
+V_baso   <- 0.6         # basolateral volume (mL)
+t_s      <- 24 * 3600   # incubation time (s)
+
+std <- read_csv("data/flux_standards.csv")
+smp <- read_csv("data/flux_samples.csv")
+```
+
+## Step 1: standard curve
+
+Linear fit over 0–25 µg/mL.
+
+```{r standard-curve}
+cal <- lm(rfu ~ conc_ug_ml, data = std)
+coef(cal)
+summary(cal)$r.squared
+```
+
+## Step 2: RFU → concentration
+
+Average the duplicate wells, convert with the standard curve and multiply by the dilution. Every sample
+must lie inside the standards: the table of samples outside the range should be empty.
+
+```{r concentration}
+conc <- smp %>%
+  group_by(insert, condition, side, dilution) %>%
+  summarise(rfu = mean(rfu), .groups = "drop") %>%
+  mutate(conc_ug_ml = (rfu - coef(cal)[1]) / coef(cal)[2] * dilution,
+         in_range   = between(rfu, min(std$rfu), max(std$rfu)))
+conc %>% filter(!in_range)
+```
+
+## Step 3: amount crossed, % of the dose, Papp
+
+The apical recovery (crossed + left apically, as % of the dose) is a check on the whole measurement.
+
+```{r papp}
+papp <- conc %>%
+  select(insert, condition, side, conc_ug_ml) %>%
+  pivot_wider(names_from = side, values_from = conc_ug_ml) %>%
+  mutate(crossed_ug  = basolateral * V_baso,
+         pct_dose    = 100 * crossed_ug / (C0 * V_api),
+         recovery    = 100 * (crossed_ug + apical * V_api) / (C0 * V_api),
+         papp_cm_s   = crossed_ug / (t_s * area_cm2 * C0),
+         condition   = factor(condition, levels = conds))
+papp
+write_csv(papp, "results/flux_papp.csv")
+```
+
+## Step 4: every P80 concentration vs control
+
+Papp is compared on the log scale. Dunnett on log10 Papp; `fold` is the back-transformed fold change in
+Papp vs control.
+
+```{r compare}
+papp <- papp %>% mutate(log_papp = log10(papp_cm_s))
+papp %>% group_by(condition) %>%
+  summarise(geo_mean_papp = 10^mean(log_papp), mean_pct_dose = mean(pct_dose))
+fit <- aov(log_papp ~ condition, data = papp)
+shapiro_test(residuals(fit))
+papp %>% levene_test(log_papp ~ condition)
+papp %>% anova_test(log_papp ~ condition)
+emmeans(fit, trt.vs.ctrl ~ condition)$contrasts %>%
+  summary(infer = TRUE) %>% mutate(fold = 10^estimate)
+```
+
+Unequal SDs: Games–Howell. Rank-based check: Kruskal–Wallis + Dunn vs control (Holm).
+
+```{r compare-checks}
+papp %>% games_howell_test(log_papp ~ condition) %>% filter(group1 == "ctrl")
+papp %>% kruskal_test(papp_cm_s ~ condition)
+papp %>% dunn_test(papp_cm_s ~ condition, p.adjust.method = "none") %>%
+  filter(group1 == "ctrl") %>% adjust_pvalue(method = "holm")
+```
+
+## Comparison plot
+
+Papp of every insert by condition, on a log scale. The bar is the geometric mean, and the p-values
+are Dunnett's test of each P80 concentration against the control (on log10 Papp, as above).
+
+```{r comparison-plot}
+dunnett <- emmeans(fit, trt.vs.ctrl ~ condition)$contrasts %>% as.data.frame() %>%
+  mutate(condition = str_remove_all(contrast, "[()]| - ctrl"),
+         label     = if_else(p.value < 0.001, "p < 0.001", sprintf("p = %.2f", p.value)))
+pc <- ggplot(papp, aes(condition, papp_cm_s * 1e7)) +
+  stat_summary(fun = mean, geom = "crossbar", width = 0.5, colour = "#333333") +
+  geom_jitter(aes(colour = condition, shape = condition), width = 0.1, height = 0, size = 3) +
+  geom_text(data = dunnett, aes(condition, 16, label = label), size = 4.2) +
+  scale_y_log10(breaks = c(0.3, 1, 3, 10), limits = c(0.25, 20)) +
+  scale_x_discrete(labels = labels) +
+  scale_colour_manual(values = cols, guide = "none") +
+  scale_shape_manual(values = c(16, 15, 17, 18), guide = "none") +
+  labs(x = NULL, y = "FD4 Papp (10⁻⁷ cm/s, log scale)",
+       caption = "Simulated data, n = 4 inserts; bar = geometric mean; Dunnett vs control")
+pc
+ggsave("figures/04_flux_comparison.png", pc, width = 6, height = 4.1, dpi = 200, bg = "white")
+```
+
+## Step 5: TEER and flux together
+
+TEER at 48 h against Papp of the same insert (Spearman).
+
+```{r teer-vs-flux}
+teer48 <- read_csv("results/teer_per_insert.csv") %>%
+  filter(time_h == 48) %>% select(insert, teer)
+both <- left_join(papp, teer48, by = "insert")
+both %>% cor_test(teer, papp_cm_s, method = "spearman")
+```
+
+## Plot
+
+```{r plot}
+p <- ggplot(both, aes(teer, papp_cm_s * 1e7, colour = condition, shape = condition)) +
+  geom_point(size = 3.2) +
+  scale_y_log10(breaks = c(0.3, 1, 3, 10)) +
+  scale_colour_manual(values = cols, labels = labels) +
+  scale_shape_manual(values = c(16, 15, 17, 18), labels = labels) +
+  labs(x = "TEER at 48 h (Ω cm²)", y = "FD4 Papp (10⁻⁷ cm/s, log scale)", colour = NULL, shape = NULL,
+       caption = "Simulated data, one point per insert (4 per condition)")
+p
+ggsave("figures/04_flux_papp_vs_teer.png", p, width = 6, height = 4.1, dpi = 200, bg = "white")
+```
+
+## Dose plot
+
+Papp against the P80 concentration, both on log scales. The control has no P80; it sits at the left.
+On the log scale the mean is the geometric mean. Papp is plotted in units of 10⁻⁷ cm/s.
+
+```{r dose-plot}
+dose_x <- c(ctrl = 0.006, `P80-0.02` = 0.02, `P80-0.1` = 0.1, `P80-0.5` = 0.5)
+papp <- papp %>% mutate(dose = dose_x[as.character(condition)])
+pd <- ggplot(papp, aes(dose, papp_cm_s * 1e7)) +
+  stat_summary(fun = mean, geom = "line", colour = "grey40", linewidth = 0.9) +
+  stat_summary(fun.data = mean_sdl, fun.args = list(mult = 1), geom = "errorbar",
+               width = 0.1, colour = "grey40") +
+  geom_point(aes(colour = condition, shape = condition), size = 3,
+             position = position_jitter(width = 0.04, height = 0, seed = 364)) +
+  scale_x_log10(breaks = dose_x, labels = c("Control", "0.02", "0.1", "0.5")) +
+  scale_y_log10(breaks = c(0.3, 1, 3, 10)) +
+  scale_colour_manual(values = cols, guide = "none") +
+  scale_shape_manual(values = c(16, 15, 17, 18), guide = "none") +
+  labs(x = "P80 (% v/v, log scale)", y = "FD4 Papp (10⁻⁷ cm/s, log scale)",
+       caption = "Simulated data, one point per insert; geometric mean ± SD (n = 4)")
+pd
+ggsave("figures/04_flux_dose.png", pd, width = 6, height = 4.1, dpi = 200, bg = "white")
+```

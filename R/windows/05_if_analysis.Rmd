@@ -1,0 +1,132 @@
+---
+title: "BME364: 05 ZO-1 immunofluorescence"
+subtitle: "Fiji results → ZO-1/DAPI ratio → well means → tests → mixed model → SuperPlot"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+---
+
+```{r setup, include = FALSE}
+# Run every chunk from the project folder (two levels up from R/windows/), where data/ is
+knitr::opts_knit$set(root.dir = "../..")
+knitr::opts_chunk$set(message = FALSE, fig.width = 6.6, fig.height = 4.3)
+```
+
+**Data:** `data/fiji_results_zo1.csv` (one row per field, the output of `fiji/measure_zo1.ijm`) and
+`data/image_metadata.csv` (what each image is). Simulated. One Caco-2 experiment in a 24-well
+glass-bottom plate: 4 conditions (control, P80 0.02, 0.1, 0.5 %) × 4 wells × 5 fields. **n = wells per
+condition:** fields in one well are not independent.
+
+Read-out per field: the **ZO-1/DAPI ratio** = whole-field ZO-1 mean / whole-field DAPI mean,
+i.e. ZO-1 per nuclear DNA, per cell. Both means are raw. Gaps in the monolayer lower ZO-1 and DAPI
+together.
+
+```{r packages}
+library(tidyverse)
+library(rstatix)
+library(lmerTest)
+library(emmeans)
+dir.create("figures", showWarnings = FALSE)
+theme_set(theme_minimal(base_size = 15) +
+            theme(panel.grid.minor = element_blank(), legend.position = "top"))
+conds  <- c("ctrl", "P80-0.02", "P80-0.1", "P80-0.5")
+labels <- c(ctrl = "Control", `P80-0.02` = "P80 0.02 %", `P80-0.1` = "P80 0.1 %",
+            `P80-0.5` = "P80 0.5 %")
+well_cols <- c(well1 = "#0028A5", well2 = "#1EA7C4", well3 = "#F3AB00", well4 = "#BF0D3E")
+```
+
+## Step 1: import and join
+
+The file names carry no design; `image_metadata.csv` says what each image is. The join adds it to
+every measurement, matched by file name.
+
+```{r import}
+results  <- read_csv("data/fiji_results_zo1.csv") %>%
+  select(-any_of(c(" ", "...1")))                           # Fiji row numbers, if saved
+metadata <- read_csv("data/image_metadata.csv")
+fields <- inner_join(metadata, results, by = join_by(file == Label))
+```
+
+## Step 2: ZO-1/DAPI ratio
+
+Both means are raw: nothing is subtracted.
+
+```{r ratio}
+fields <- fields %>%
+  mutate(ratio     = ZO1_Mean / DAPI_Mean,
+         condition = factor(condition, levels = conds),
+         well_id   = plate_well)                           # unique well on the plate (A1, B3, ...)
+```
+
+## Step 3: fields → wells
+
+The wells are the technical replicates, so they are the n.
+
+```{r well-means}
+well_means <- fields %>%
+  group_by(condition, well, well_id) %>%
+  summarise(ratio = mean(ratio), n_fields = n(), .groups = "drop")
+well_means
+well_means %>% group_by(condition) %>%
+  summarise(mean_ratio = mean(ratio), sd_ratio = sd(ratio))
+```
+
+## Step 4: ZO-1/DAPI ratio, every P80 concentration vs control
+
+### 4a. Wrong: every field as independent
+
+Pseudoreplication: 20 fields per condition, df = 3, 76.
+
+```{r wrong}
+fit_fields <- aov(ratio ~ condition, data = fields)
+fields %>% anova_test(ratio ~ condition)
+emmeans(fit_fields, trt.vs.ctrl ~ condition)$contrasts
+```
+
+### 4b. Right: one value per well
+
+ANOVA + Dunnett on the well means, n = 4 per condition, df = 3, 12.
+
+```{r right-wells}
+fit_wells <- aov(ratio ~ condition, data = well_means)
+well_means %>% levene_test(ratio ~ condition)
+well_means %>% anova_test(ratio ~ condition)
+emmeans(fit_wells, trt.vs.ctrl ~ condition)$contrasts %>% summary(infer = TRUE)
+```
+
+### 4c. Right: keep all fields, model the nesting
+
+Random intercept per well, Kenward–Roger degrees of freedom.
+
+```{r right-mixed}
+fit <- lmer(ratio ~ condition + (1 | well_id), data = fields)
+VarCorr(fit)
+anova(fit, ddf = "Kenward-Roger")
+emmeans(fit, trt.vs.ctrl ~ condition, lmer.df = "kenward-roger")$contrasts
+```
+
+## Step 5: SuperPlot
+
+Fields in the background, coloured by well; the well means on top.
+
+```{r superplot}
+p <- ggplot(fields, aes(condition, ratio)) +
+  geom_jitter(aes(colour = well), width = 0.15,
+              alpha = 0.45, size = 1.8) +
+  stat_summary(data = well_means, fun = mean, geom = "crossbar",
+               width = 0.5, colour = "#333333") +
+  geom_point(data = well_means, aes(fill = well, shape = well),
+             size = 4.5, colour = "#333333",
+             position = position_dodge(width = 0.35)) +
+  scale_colour_manual(values = well_cols) +
+  scale_fill_manual(values = well_cols) +
+  scale_shape_manual(values = c(21, 22, 24, 23)) +
+  scale_x_discrete(labels = labels) +
+  labs(x = NULL, y = "ZO-1 / DAPI ratio",
+       colour = "Well", fill = "Well", shape = "Well",
+       caption = "Simulated data; dots = fields, symbols = wells")
+p
+ggsave("figures/05_if_superplot.png", p,
+       width = 6.6, height = 4.3, dpi = 200, bg = "white")
+```

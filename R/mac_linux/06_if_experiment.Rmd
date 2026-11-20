@@ -1,0 +1,192 @@
+---
+title: "BME364: 06 ZO-1 immunofluorescence, the real experiment"
+subtitle: "Fiji results → quality check → ZO-1 per nuclear area → well means → tests → SuperPlot"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+---
+
+```{r setup, include = FALSE}
+# Run every chunk from the project folder (two levels up from R/mac_linux/), where data/ is
+knitr::opts_knit$set(root.dir = "../..")
+knitr::opts_chunk$set(message = FALSE, fig.width = 6.6, fig.height = 4.3)
+```
+
+**Data.** The 18 confocal z-stacks of the Group I experiment (13 November 2026) in
+`raw_data/confocal_zo1_8bit/`. Caco-2 monolayers in a 24-well glass-bottom plate, 3 conditions
+(control, P80 0.02 % and 0.1 %), 3 wells per condition and 2 images per well.
+**n = wells per condition = 3.** The 2 images of one well are not independent.
+
+**8-bit and 16-bit files.** The images in `raw_data/confocal_zo1_8bit/` are 8-bit copies, converted
+with the same linear scale for every image (`scaling_8bit.csv`). The original 16-bit TIFF files are on
+OneDrive in `Class Materials/Group1_IF_raw_files/16bit`.
+
+**Before you knit.** Run `fiji/measure_zo1_experiment.ijm` in Fiji on the folder
+`raw_data/confocal_zo1_8bit`. It writes `results/zo1_experiment_fiji.csv`, one row per image.
+
+**Read-out per image.** ZO-1 per nuclear area, the total ZO-1 of the field divided by the area of the
+nuclei. The macro makes a maximum projection, takes the ZO-1 mean of the field, and finds the nuclei in
+the DAPI image with a Li threshold and a watershed (see the watershed deck). DAPI only decides where the
+nuclei are, not how bright they are.
+
+```{r packages}
+library(tidyverse)
+library(rstatix)
+library(lmerTest)
+library(emmeans)
+dir.create("figures", showWarnings = FALSE)
+theme_set(theme_minimal(base_size = 15) +
+            theme(panel.grid.minor = element_blank(), legend.position = "top"))
+conds  <- c("ctrl", "P80-0.02", "P80-0.1")
+labels <- c(ctrl = "Control", `P80-0.02` = "P80 0.02 %", `P80-0.1` = "P80 0.1 %")
+well_cols <- c(well1 = "#0028A5", well2 = "#1EA7C4", well3 = "#F3AB00")
+```
+
+## Step 1: import and join
+
+```{r import}
+fiji_file <- "results/zo1_experiment_fiji.csv"
+if (!file.exists(fiji_file))
+  stop("Run fiji/measure_zo1_experiment.ijm on raw_data/confocal_zo1_8bit first.")
+results  <- read_csv(fiji_file)
+metadata <- read_csv("raw_data/confocal_zo1_8bit/image_metadata.csv")
+images <- inner_join(metadata, results, by = join_by(file == Label)) %>%
+  mutate(condition = factor(condition, levels = conds),
+         well_id   = plate_well)                           # unique well on the plate (A1, B3, ...)
+stopifnot(nrow(images) == nrow(metadata))                  # every image measured once
+count(images, condition)
+```
+
+## Step 2: quality check
+
+**Nuclear area** is the share of the field that the macro counted as nucleus. **Nuclei** is the number
+of objects after the watershed. Look for images that are very different from the others in their
+condition, and check their outlines in Fiji. A dim or out-of-focus field has a low ZO-1 mean and few
+nuclei.
+
+```{r qc, fig.height = 3.6}
+images %>%
+  select(file, condition, ZO1_Mean, Nuclear_Area_pct, Nuclei) %>%
+  arrange(condition, file)
+
+images %>%
+  pivot_longer(c(Nuclear_Area_pct, Nuclei), names_to = "check", values_to = "value") %>%
+  mutate(check = recode(check, Nuclear_Area_pct = "Nuclear area (% of field)",
+                        Nuclei = "Nuclei per field")) %>%
+  ggplot(aes(condition, value)) +
+  geom_jitter(aes(colour = well), width = 0.12, size = 2.5) +
+  facet_wrap(~ check, scales = "free_y") +
+  scale_colour_manual(values = well_cols) +
+  scale_x_discrete(labels = c(ctrl = "Ctrl", `P80-0.02` = "0.02", `P80-0.1` = "0.1")) +
+  labs(x = "P80 (%)", y = NULL, colour = "Well")
+```
+
+## Step 3: ZO-1 per nuclear area
+
+`ZO1_Mean` is the mean of the whole field, and `Nuclear_Area_pct` the share of the field inside
+nuclei. Their ratio is the total ZO-1 divided by the number of nuclear pixels.
+
+```{r ratio}
+images <- images %>%
+  mutate(zo1_per_nuc_area = ZO1_Mean / (Nuclear_Area_pct / 100))
+```
+
+## Step 4: images → wells
+
+The wells are the technical replicates, so they are the n.
+
+```{r well-means}
+well_means <- images %>%
+  group_by(condition, well, well_id) %>%
+  summarise(across(c(ZO1_Mean, Nuclear_Area_pct, Nuclei, zo1_per_nuc_area), mean),
+            n_images = n(), .groups = "drop")
+well_means
+well_means %>% group_by(condition) %>%
+  summarise(mean = mean(zo1_per_nuc_area), sd = sd(zo1_per_nuc_area)) %>%
+  mutate(pct_of_control = 100 * mean / mean[condition == "ctrl"])
+```
+
+## Step 5: every P80 concentration vs control
+
+### 5a. One value per well
+
+ANOVA and Dunnett on the well means, n = 3 per condition, df = 2 and 6.
+
+```{r wells}
+fit_wells <- aov(zo1_per_nuc_area ~ condition, data = well_means)
+well_means %>% levene_test(zo1_per_nuc_area ~ condition)
+well_means %>% anova_test(zo1_per_nuc_area ~ condition)
+emmeans(fit_wells, trt.vs.ctrl ~ condition)$contrasts %>% summary(infer = TRUE)
+```
+
+The nuclear area on its own. If it changed with P80, the ratio would change even with the same ZO-1.
+
+```{r wells-area}
+emmeans(aov(Nuclear_Area_pct ~ condition, data = well_means), trt.vs.ctrl ~ condition)$contrasts %>%
+  summary(infer = TRUE)
+```
+
+### 5b. Keep both images, model the wells
+
+Random intercept per well. With 2 images per well, the well variance is estimated from very little
+data. A "boundary (singular) fit" message means the model found no variation between wells beyond the
+variation between images.
+
+```{r mixed}
+fit <- lmer(zo1_per_nuc_area ~ condition + (1 | well_id), data = images)
+VarCorr(fit)
+anova(fit, ddf = "Kenward-Roger")
+emmeans(fit, trt.vs.ctrl ~ condition, lmer.df = "kenward-roger")$contrasts
+```
+
+## Step 6: SuperPlot
+
+Images in the background, coloured by well. The well means on top. The brackets show the Dunnett
+tests of Step 5a, every P80 concentration against the control.
+
+```{r superplot, fig.height = 4.6}
+# one bracket per comparison with the control, stars from the Dunnett P values of the well means
+top <- max(images$zo1_per_nuc_area)
+brackets <- summary(emmeans(fit_wells, trt.vs.ctrl ~ condition)$contrasts) %>%
+  as_tibble() %>%
+  mutate(x = 1, xend = 2:3, y = top * c(1.08, 1.2),
+         label = case_when(p.value < 0.001 ~ "***", p.value < 0.01 ~ "**",
+                           p.value < 0.05 ~ "*", TRUE ~ "ns"))
+
+p <- ggplot(images, aes(condition, zo1_per_nuc_area)) +
+  geom_jitter(aes(colour = well), width = 0.15, alpha = 0.5, size = 2) +
+  stat_summary(data = well_means, fun = mean, geom = "crossbar",
+               width = 0.5, colour = "#333333") +
+  geom_point(data = well_means, aes(fill = well, shape = well),
+             size = 4.5, colour = "#333333",
+             position = position_dodge(width = 0.35)) +
+  scale_colour_manual(values = well_cols) +
+  scale_fill_manual(values = well_cols) +
+  scale_shape_manual(values = c(21, 22, 24)) +
+  geom_segment(data = brackets, aes(x = x, xend = xend, y = y, yend = y), inherit.aes = FALSE) +
+  geom_segment(data = brackets, aes(x = x, xend = x, y = y, yend = y - top * 0.025), inherit.aes = FALSE) +
+  geom_segment(data = brackets, aes(x = xend, xend = xend, y = y, yend = y - top * 0.025),
+               inherit.aes = FALSE) +
+  geom_text(data = brackets, aes(x = (x + xend) / 2, y = y, label = label),
+            vjust = -0.3, size = 5, inherit.aes = FALSE) +
+  scale_x_discrete(labels = labels) +
+  expand_limits(y = c(0, top * 1.3)) +
+  labs(x = NULL, y = "ZO-1 per nuclear area",
+       colour = "Well", fill = "Well", shape = "Well",
+       caption = paste0("Real data, 13 November 2026. Dots = images, symbols = wells.\n",
+                        "Dunnett vs control, n = 3 wells. * P < 0.05, ** P < 0.01, *** P < 0.001")) +
+  theme(plot.caption = element_text(hjust = 0))
+p
+ggsave("figures/06_if_experiment_superplot.png", p,
+       width = 6.6, height = 4.6, dpi = 200, bg = "white")
+```
+
+## Questions
+
+1. Why is ZO-1 divided by the nuclear area and not by the DAPI mean? What would change if the nuclei
+   were dimmer with P80?
+2. The watershed changes the number of nuclei a lot but the nuclear area very little. Why? Would you
+   need the watershed if you only wanted the nuclear area?
+3. With 3 wells per condition and one experiment, what can you conclude, and what would you need to
+   repeat?
